@@ -106,17 +106,25 @@ class Store(context: Context) {
 
     // ------------------------------------------------------------ Torrents
 
-    var spaceSaver: Boolean
-        get() = sp.getBoolean("space_saver", true)
-        set(v) { sp.edit().putBoolean("space_saver", v).apply() }
-
+    /** Caché de TorrServer en MB (solo la ventana alrededor de lo que se ve; lo demás se suelta). */
     var cacheMb: Int
-        get() = sp.getInt("cache_mb", 500)
-        set(v) { sp.edit().putInt("cache_mb", v).apply() }
+        get() = sp.getInt("ts_cache_mb", 128)
+        set(v) { sp.edit().putInt("ts_cache_mb", v).apply() }
 
-    var bufferMb: Int
-        get() = sp.getInt("buffer_mb", 10)
-        set(v) { sp.edit().putInt("buffer_mb", v).apply() }
+    /** Caché en el disco de la app (permite cachés grandes) en vez de en memoria. */
+    var cacheOnDisk: Boolean
+        get() = sp.getBoolean("ts_cache_disk", false)
+        set(v) { sp.edit().putBoolean("ts_cache_disk", v).apply() }
+
+    /** Lo que se precarga antes de empezar, en % de la caché. */
+    var preloadPercent: Int
+        get() = sp.getInt("ts_preload", 30)
+        set(v) { sp.edit().putInt("ts_preload", v).apply() }
+
+    /** Aceleración por hardware en VLC (si una imagen sale negra o verde, se reintenta sola sin ella). */
+    var hwDecoding: Boolean
+        get() = sp.getBoolean("vlc_hw", true)
+        set(v) { sp.edit().putBoolean("vlc_hw", v).apply() }
 
     var uploadKbps: Int
         get() = sp.getInt("upload_kbps", 0)

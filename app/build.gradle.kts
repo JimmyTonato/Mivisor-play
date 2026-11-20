@@ -109,7 +109,7 @@ dependencies {
     implementation(project(":core:reliability"))
     implementation(project(":core:engine"))
     implementation(project(":engine:outpace"))
-    implementation(project(":engine:torrent"))
+    implementation(project(":engine:torrserver"))
     implementation(project(":feature:playback"))
     implementation(project(":ui:design"))
 
@@ -124,6 +124,18 @@ dependencies {
     implementation(libs.coroutines.android)
     implementation(libs.media3.exoplayer)
     implementation(libs.media3.ui)
+    implementation(libs.libvlc)
 
     testImplementation(libs.junit)
 }
+
+// TorrServer (motor de torrents, proceso aparte como Outpace): en GitHub Actions, si falta el binario, se compila
+// antes que la app con tools/build-torrserver.sh (descarga el Go que pide TorrServer y usa el NDK ya instalado).
+val torrServerBins = listOf("arm64-v8a", "armeabi-v7a").map { file("src/main/jniLibs/$it/libtorrserver.so") }
+val buildTorrServer = tasks.register<Exec>("buildTorrServer") {
+    description = "Compila TorrServer para Android (ARM64 y ARMv7)"
+    onlyIf { System.getenv("CI") != null && torrServerBins.any { !it.isFile } }
+    workingDir = rootProject.projectDir
+    commandLine("bash", "tools/build-torrserver.sh")
+}
+tasks.named("preBuild") { dependsOn(buildTorrServer) }

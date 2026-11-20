@@ -12,3 +12,9 @@
 }
 # Copias cifradas (3d): el JSON de la copia se lee y escribe con Gson.
 -keep class com.mivisor.tv.backup.** { *; }
+
+# VLC: su parte nativa (libvlcjni) llama a estas clases Java por su nombre (eventos, pistas, superficies).
+# Si R8 las renombra o las quita, el reproductor se cierra al empezar.
+-keep class org.videolan.libvlc.** { *; }
+-keep interface org.videolan.libvlc.** { *; }
+-dontwarn org.videolan.libvlc.**

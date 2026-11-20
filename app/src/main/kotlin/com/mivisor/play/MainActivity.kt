@@ -40,9 +40,11 @@ class MainActivity : ComponentActivity() {
         super.onStart()
         EngineManager.cancelBackgroundStop()
         graph.externalPlayback = false
+        graph.markForeground(true)
     }
 
     override fun onStop() {
+        graph.markForeground(false)
         // Sin trabajo en segundo plano: se para la reproducción ya y el motor al cabo de un rato.
         graph.player.stop()
         // Si el vídeo se está viendo en otro reproductor, la descarga sigue (si no, se cortaría).

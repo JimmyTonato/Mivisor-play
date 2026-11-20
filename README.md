@@ -8,24 +8,27 @@ Se instala junto a MiVisor TV sin reemplazarla (paquete `com.mivisor.play`).
 | Qué | Cómo | Motor |
 |---|---|---|
 | Ace Stream | ID de 40 caracteres, `acestream://…` o un texto con el ID dentro | **Outpace** (el de MiVisor TV, con sus parches) → HLS → Media3 |
-| Magnet | `magnet:?xt=…` | **libtorrent** → servidor local → Media3 |
-| Archivo .torrent | Botón «Archivo .torrent» o «Abrir con… MiVisor Play» desde otra app | **libtorrent** → servidor local → Media3 |
+| Magnet | `magnet:?xt=…` | **TorrServer** (proceso aparte) → **VLC** dentro de la app |
+| Archivo .torrent | Botón «Archivo .torrent» o «Abrir con… MiVisor Play» desde otra app | **TorrServer** (proceso aparte) → **VLC** dentro de la app |
 
 También aparece en «Abrir con» y en «Compartir» de otras apps (navegador, Telegram, gestor de archivos).
 
-## Torrents: se ven mientras se descargan, y lo visto se borra
+## Torrents y magnet: montado como Ace Stream
 
-- Se descarga en orden, empezando por lo que vas a ver. Si saltas a otro punto, se prioriza ese punto.
-- **Borrar lo ya visto** (activado por defecto): solo se guarda una caché alrededor de lo que estás viendo, 500 MB por
-  defecto (75 % por delante y 25 % por detrás). Lo que queda fuera se libera del disco al momento: un vídeo de 7 GB no
-  necesita 7 GB libres.
-- Si vuelves muy atrás, a una parte ya borrada, se descarga otra vez solo ese trozo.
-- Al salir del reproductor se borra todo lo descargado.
-- Ajustes: tamaño de la caché (300 MB – 2 GB), espera antes de empezar (5 – 40 MB) y límite de subida.
+Ace Stream (3.2) lleva TorrServer para los torrents, en su propio proceso, y VLC para reproducir. MiVisor Play hace lo
+mismo:
 
-**Audio AC3/DTS:** Media3 usa los decodificadores del aparato. Casi todas las teles Android los traen, pero muchos
-móviles no. Si el audio de un vídeo no se puede reproducir, la app lo avisa y ofrece **«Otro reproductor»** (VLC, MX
-Player…): el vídeo se sigue descargando mientras lo ves en esa app.
+- **TorrServer** (GPL-3.0, github.com/YouROK/TorrServer) es un ejecutable aparte, igual que Outpace: si se cae, la app
+  sigue abierta, lo explica («El motor de torrents se cerró») y lo vuelve a arrancar con Reintentar.
+- Su caché solo guarda la ventana por delante de lo que se ve y lo último visto; el resto lo suelta. Por defecto 128 MB
+  **en memoria**: no ocupa disco. En Ajustes se puede subir hasta 2 GB y guardarla en el disco de la app. Se borra sola.
+- **VLC** reproduce dentro de la app: AC3, DTS, MKV, AVI… Si con la aceleración por hardware no sale la imagen, se
+  reintenta solo sin ella en el mismo punto.
+- Ajustes: tamaño de la caché, memoria o disco, precarga, límite de subida y aceleración por hardware.
+
+**Compilación de TorrServer:** la hace Gradle solo (tarea `buildTorrServer`) en GitHub Actions cuando falta el binario:
+`tools/build-torrserver.sh` descarga el Go que pide TorrServer, lo compila con el NDK ya instalado (el de Outpace) y lo
+deja en `jniLibs/<abi>/libtorrserver.so`. No hay que tocar el workflow.
 
 ## Reproductor
 
@@ -39,7 +42,7 @@ Player…): el vídeo se sigue descargando mientras lo ves en esa app.
 
 Ajustes › **Ver el registro** muestra lo que ha pasado en la app, en Outpace y en el motor de torrents.
 **Copiar todo** lo deja en el portapapeles, listo para pegarlo y averiguar un fallo.
-Si la app se cerró sola, el motivo aparece al principio del registro la siguiente vez.
+El registro se guarda en un archivo al momento: si la app se cerró sola, al abrirla otra vez aparece lo que pasó justo antes y lo que dijo Android («Cierre anterior»). Lo que cuenta TorrServer sale con la etiqueta [TorrServer].
 
 ## Cómo se genera la APK
 
@@ -61,7 +64,7 @@ Firma: con los secretos `SIGNING_*` si están; si no, con `app/debug.keystore`, 
 | `core:*` | Módulos de MiVisor TV sin cambios: motor (supervisor de Outpace, retraso con el directo), catálogo (`DirectStream`), fiabilidad, diagnóstico |
 | `engine:outpace` | Outpace en Android (sin cambios) |
 | `feature:playback` | Reproducción de Ace Stream con Media3 (sin cambios) |
-| `engine:torrent` | **Nuevo:** libtorrent, servidor HTTP local con Range y caché que libera lo ya visto (`fallocate` PUNCH_HOLE, en C) |
+| `engine:torrserver` | **Nuevo:** arranca y vigila TorrServer como proceso aparte (como Outpace) y habla con su API |
 | `ui:design` | Base de foco para mando y táctil (`TvClickable`) y tipografía Inter |
 | `app` | **Nueva:** Inicio, reproductores, Ajustes, Registro y Licencias, con su propio diseño |
 
@@ -70,4 +73,4 @@ Quitado respecto a MiVisor TV: canales, agenda, proveedores, MiVisor Gold, WARP,
 ## Licencias
 
 Outpace es AGPL-3.0-or-later: su licencia, su aviso y la lista de cambios van dentro de la APK (Ajustes › Licencias) y
-los parches están en `tools/outpace-patches`. libtorrent4j es MIT; Inter, OFL.
+los parches están en `tools/outpace-patches`. TorrServer es GPL-3.0 (se compila sin cambios y su licencia va dentro de la APK); VLC, LGPL-2.1; Inter, OFL.

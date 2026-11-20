@@ -125,7 +125,7 @@ fun KeyCatcher(
             .pointerInput(onDoubleTapSide) {
                 detectTapGestures(
                     onTap = { onToggleControls() },
-                    onDoubleTap = if (onDoubleTapSide == null) null else { o -> onDoubleTapSide(if (o.x < size.width / 2f) -1 else 1) }
+                    onDoubleTap = if (onDoubleTapSide == null) null else { o: androidx.compose.ui.geometry.Offset -> onDoubleTapSide(if (o.x < size.width / 2f) -1 else 1) }
                 )
             }
     )
@@ -287,7 +287,7 @@ fun SeekBar(position: Long, duration: Long, buffered: Float, onSeekBy: (Long) ->
                     }
                 }
                 .focusable()
-                .pointerInput(duration) { detectTapGestures { o -> if (duration > 0) onSeekTo(o.x / size.width) } },
+                .pointerInput(duration) { detectTapGestures(onTap = { o: androidx.compose.ui.geometry.Offset -> if (duration > 0) onSeekTo(o.x / size.width) }) },
             contentAlignment = Alignment.Center
         ) {
             val f = if (duration > 0) position.toFloat() / duration else 0f

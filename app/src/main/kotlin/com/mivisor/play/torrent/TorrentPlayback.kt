@@ -1,20 +1,13 @@
 package com.mivisor.play.torrent
 
 import android.content.Context
-import androidx.annotation.OptIn
-import androidx.media3.common.C
-import androidx.media3.common.MediaItem
-import androidx.media3.common.PlaybackException
-import androidx.media3.common.Player
-import androidx.media3.common.TrackSelectionOverride
-import androidx.media3.common.Tracks
-import androidx.media3.common.util.UnstableApi
-import androidx.media3.datasource.DefaultHttpDataSource
-import androidx.media3.exoplayer.DefaultLoadControl
-import androidx.media3.exoplayer.DefaultRenderersFactory
-import androidx.media3.exoplayer.ExoPlayer
-import androidx.media3.exoplayer.source.ProgressiveMediaSource
+import android.net.Uri
 import com.mivisor.play.data.AppLog
+import com.mivisor.play.torrserver.TorrServerApi
+import com.mivisor.play.torrserver.TorrServerEngine
+import com.mivisor.play.torrserver.TsConfig
+import com.mivisor.play.torrserver.TsFile
+import com.mivisor.play.torrserver.TsStatus
 import kotlinx.coroutines.CoroutineScope
 import kotlinx.coroutines.Dispatchers
 import kotlinx.coroutines.Job
@@ -26,45 +19,46 @@ import kotlinx.coroutines.flow.asStateFlow
 import kotlinx.coroutines.isActive
 import kotlinx.coroutines.launch
 import kotlinx.coroutines.withContext
-import org.libtorrent4j.TorrentInfo
+import org.videolan.libvlc.LibVLC
+import org.videolan.libvlc.Media
+import org.videolan.libvlc.MediaPlayer
+import org.videolan.libvlc.util.VLCVideoLayout
 import java.io.File
 
 /**
- * Torrents y magnet: motor de torrents ([TorrentEngine]) → servidor local ([StreamServer]) → Media3 (el mismo
- * reproductor que las emisiones de Ace Stream). Se usa siempre desde el hilo principal.
+ * Torrents y magnet, como Ace Stream: TorrServer (proceso aparte) descarga y sirve el vídeo por HTTP en 127.0.0.1, y
+ * VLC lo reproduce dentro de la app (lee cualquier audio: AC3, DTS…). Se usa siempre desde el hilo principal.
  */
-@OptIn(UnstableApi::class)
-class TorrentPlayback(context: Context) {
+class TorrentPlayback(context: Context, private val config: () -> TsConfig, private val hwDecoding: () -> Boolean) {
 
     enum class Phase { IDLE, METADATA, CHOOSE, CONNECTING, PLAYING, FAILED }
 
-    data class FileOption(val index: Int, val name: String, val size: Long)
+    data class FileOption(val id: Int, val name: String, val size: Long)
 
-    data class Track(val type: Int, val group: Int, val track: Int, val label: String, val selected: Boolean, val supported: Boolean)
+    /** Pista de audio o subtítulos de VLC ([id] es el de VLC; -1 = desactivados). */
+    data class Track(val id: Int, val label: String, val selected: Boolean)
 
     data class Ui(
         val phase: Phase = Phase.IDLE,
         val title: String = "",
         val message: String? = null,
         val files: List<FileOption> = emptyList(),
-        /** 0..1 del buffer inicial (antes de que empiece la imagen). */
+        /** 0..1 de la precarga antes de que salga la imagen. */
         val prepare: Float = 0f,
-        val downBps: Int = 0,
+        val downBps: Long = 0,
         val peers: Int = 0,
+        val totalPeers: Int = 0,
         val seeds: Int = 0,
-        val diskBytes: Long = 0,
-        /** 0..1 hasta dónde hay datos seguidos desde lo que se está viendo. */
-        val buffered: Float = 0f,
         val buffering: Boolean = false,
+        val bufferPct: Float = 0f,
         val paused: Boolean = false,
         val positionMs: Long = 0,
         val durationMs: Long = 0,
-        val tracks: List<Track> = emptyList(),
-        /** El vídeo trae audio pero ninguna pista se puede reproducir en este aparato (AC3/DTS en muchos móviles). */
-        val audioUnsupported: Boolean = false,
-        val recovering: Boolean = false,
-        val punchUnsupported: Boolean = false,
-        val streamUrl: String? = null
+        val audio: List<Track> = emptyList(),
+        val subs: List<Track> = emptyList(),
+        val engineDied: Boolean = false,
+        val streamUrl: String? = null,
+        val fileSize: Long = 0
     ) {
         val active: Boolean get() = phase != Phase.IDLE && phase != Phase.FAILED
     }
@@ -74,224 +68,292 @@ class TorrentPlayback(context: Context) {
     private val _ui = MutableStateFlow(Ui())
     val ui: StateFlow<Ui> = _ui.asStateFlow()
 
-    var player: ExoPlayer? = null
+    private var libVlc: LibVLC? = null
+    var player: MediaPlayer? = null
         private set
-    private var server: StreamServer? = null
-    private var info: TorrentInfo? = null
+    private var layout: VLCVideoLayout? = null
+    private var attached = false
+    private var base: String? = null
+    private var hash: String? = null
+    private var files: List<TsFile> = emptyList()
     private var job: Job? = null
     private var ticker: Job? = null
     private var generation = 0
-    private var playerStarted = false
-    private var retries = 0
+    private var hwInUse = true
+    private var triedSoftware = false
+    private var voutCount = 0
+    private var playingSince = 0L
 
-    private val listener = object : Player.Listener {
-        override fun onRenderedFirstFrame() {
-            if (_ui.value.phase != Phase.PLAYING) AppLog.add("Torrent", "Imagen en pantalla")
-            _ui.value = _ui.value.copy(phase = Phase.PLAYING, message = null)
-            retries = 0
-        }
+    // ------------------------------------------------------------------------------------------ Vista
 
-        override fun onPlaybackStateChanged(playbackState: Int) {
-            _ui.value = _ui.value.copy(buffering = playbackState == Player.STATE_BUFFERING)
-            if (playbackState == Player.STATE_READY && _ui.value.phase == Phase.CONNECTING && player?.videoSize?.width == 0) {
-                // Solo audio (o aún sin vídeo): también cuenta como reproduciendo.
-                _ui.value = _ui.value.copy(phase = Phase.PLAYING, message = null)
-            }
-        }
-
-        override fun onIsPlayingChanged(isPlaying: Boolean) {
-            val p = player ?: return
-            _ui.value = _ui.value.copy(paused = !isPlaying && !p.playWhenReady)
-        }
-
-        override fun onTracksChanged(tracks: Tracks) {
-            val list = trackList(tracks)
-            val audio = list.filter { it.type == C.TRACK_TYPE_AUDIO }
-            val unsupported = audio.isNotEmpty() && audio.none { it.supported }
-            if (unsupported && !_ui.value.audioUnsupported) AppLog.add("Torrent", "Ninguna pista de audio se puede reproducir aquí: ${audio.joinToString { it.label }}")
-            _ui.value = _ui.value.copy(tracks = list, audioUnsupported = unsupported)
-        }
-
-        override fun onPlayerError(error: PlaybackException) {
-            AppLog.add("Torrent", "Error del reproductor: ${error.errorCodeName} · ${error.message}")
-            val p = player ?: return
-            // Los datos llegan mientras se descargan: un corte de lectura se reintenta en el mismo punto.
-            if (retries < 5 && TorrentEngine.handle != null) {
-                retries++
-                val pos = p.currentPosition
-                scope.launch {
-                    delay(1500L * retries)
-                    player?.let { it.seekTo(pos); it.prepare(); it.play() }
-                }
-            } else {
-                fail("No se puede reproducir este vídeo (${error.errorCodeName}). Prueba «Abrir con otro reproductor».")
-            }
-        }
+    /** La pantalla da su superficie de vídeo (puede llegar antes o después de crear el reproductor). */
+    fun attach(view: VLCVideoLayout) {
+        if (layout === view && attached) return
+        layout = view
+        val p = player ?: return
+        if (attached) runCatching { p.detachViews() }
+        runCatching { p.attachViews(view, null, true, false); attached = true }
+            .onFailure { AppLog.add("Torrent", "No se pudo poner el vídeo en pantalla: ${it.message}") }
     }
 
-    // ------------------------------------------------------------------------------------------ API
-
-    /** Abre un archivo .torrent ya guardado en la app. */
-    fun openFile(path: String, title: String) = begin(title) {
-        TorrentEngine.ensureStarted(app)
-        TorrentInfo(File(path))
+    fun detach(view: VLCVideoLayout) {
+        if (layout !== view) return
+        runCatching { player?.detachViews() }
+        attached = false
+        layout = null
     }
 
-    /** Abre un enlace magnet (primero descarga su información de los demás usuarios). */
-    fun openMagnet(uri: String, title: String) = begin(title) {
-        TorrentEngine.ensureStarted(app)
-        withContext(Dispatchers.Main) { _ui.value = _ui.value.copy(message = "Pidiendo la información del magnet a otros usuarios… (hasta 1,5 min)") }
-        TorrentEngine.fetchMagnet(app, uri) ?: throw IllegalStateException("Nadie contestó con la información de este magnet. Prueba más tarde.")
+    // ------------------------------------------------------------------------------------------ Abrir
+
+    fun openFile(path: String, title: String) = begin(title, "Leyendo el .torrent…") { b ->
+        TorrServerApi.upload(b, File(path), title)
     }
 
-    private fun begin(title: String, load: suspend () -> TorrentInfo) {
+    fun openMagnet(uri: String, title: String) = begin(title, "Pidiendo la información del magnet a otros usuarios…") { b ->
+        TorrServerApi.add(b, uri, title)
+    }
+
+    private fun begin(title: String, loading: String, add: (String) -> TsStatus) {
         stop()
         val gen = ++generation
-        _ui.value = Ui(phase = Phase.METADATA, title = title, message = "Leyendo el torrent…")
+        _ui.value = Ui(phase = Phase.METADATA, title = title, message = "Arrancando el motor de torrents…")
         job = scope.launch {
             try {
-                val ti = withContext(Dispatchers.IO) { load() }
+                val b = withContext(Dispatchers.IO) { TorrServerEngine.ensureStarted(app, config()) }
                 if (gen != generation) return@launch
-                info = ti
-                val fs = ti.files()
-                var files = (0 until fs.numFiles()).map { FileOption(it, fs.fileName(it), fs.fileSize(it)) }
-                val videos = files.filter { Util.isVideo(it.name) }
-                if (videos.isNotEmpty()) files = videos
-                files = files.sortedByDescending { it.size }
-                AppLog.add("Torrent", "«${ti.name()}»: ${fs.numFiles()} archivos, ${Util.bytes(ti.totalSize())}")
-                if (files.size == 1) choose(files[0].index)
-                else _ui.value = _ui.value.copy(phase = Phase.CHOOSE, title = ti.name(), files = files, message = null)
+                base = b
+                _ui.value = _ui.value.copy(message = loading)
+                val first = withContext(Dispatchers.IO) { add(b) }
+                if (gen != generation) return@launch
+                val h = first.hash.takeIf { it.isNotBlank() } ?: throw IllegalStateException("El motor no devolvió el torrent")
+                hash = h
+                AppLog.add("Torrent", "Añadido ${h.take(8)}… «${first.title.ifBlank { first.name }}»")
+
+                // Un magnet tarda en traer la lista de archivos: se espera (hasta 3 min) enseñando qué pasa.
+                var st = first
+                val t0 = System.currentTimeMillis()
+                while (st.files.isEmpty()) {
+                    if (gen != generation) return@launch
+                    if (!TorrServerEngine.running()) { engineDied(); return@launch }
+                    if (System.currentTimeMillis() - t0 > 180_000) throw IllegalStateException("Nadie contestó con la información de este torrent en 3 minutos. Puede que ahora mismo nadie lo comparta.")
+                    delay(1_000)
+                    st = withContext(Dispatchers.IO) { TorrServerApi.get(b, h) } ?: st
+                    _ui.value = _ui.value.copy(
+                        peers = st.activePeers, totalPeers = st.totalPeers, seeds = st.seeders, downBps = st.downBps,
+                        message = if (st.totalPeers == 0) "$loading Buscando usuarios…" else "$loading ${st.activePeers} usuarios conectados"
+                    )
+                }
+                files = st.files
+                val name = st.name.ifBlank { st.title }.ifBlank { title }
+                var options = st.files.map { FileOption(it.id, it.name, it.length) }
+                val videos = options.filter { isVideo(it.name) }
+                if (videos.isNotEmpty()) options = videos
+                options = options.sortedByDescending { it.size }
+                AppLog.add("Torrent", "«$name»: ${st.files.size} archivos, ${videos.size} de vídeo")
+                if (options.size == 1) choose(options[0].id)
+                else _ui.value = _ui.value.copy(phase = Phase.CHOOSE, title = name, files = options, message = null)
             } catch (e: Throwable) {
-                if (gen == generation) fail(e.message ?: "El torrent no es válido")
+                if (gen == generation) {
+                    if (!TorrServerEngine.running() && TorrServerEngine.exitReason != null) engineDied()
+                    else fail(e.message ?: "No se pudo abrir el torrent")
+                }
             }
         }
     }
 
-    /** Empieza a ver el archivo [index] del torrent. */
-    fun choose(index: Int) {
-        val ti = info ?: return
-        val gen = generation
-        val name = ti.files().fileName(index)
-        _ui.value = _ui.value.copy(phase = Phase.CONNECTING, title = name, files = emptyList(), message = "Conectando con otros usuarios…")
-        job = scope.launch {
-            try {
-                withContext(Dispatchers.IO) { TorrentEngine.startStream(app, ti, index) }
-                val s = withContext(Dispatchers.IO) { StreamServer().start() }
-                if (gen != generation) { s.stop(); return@launch }
-                server = s
-                _ui.value = _ui.value.copy(streamUrl = s.url())
-                AppLog.add("Torrent", "Servidor local en el puerto ${s.port}")
-                startTicker(gen)
-            } catch (e: Throwable) {
-                if (gen == generation) fail(e.message ?: "No se pudo empezar la descarga")
+    /** Empieza a ver el archivo [id] del torrent. */
+    fun choose(id: Int) {
+        val b = base ?: return
+        val h = hash ?: return
+        val f = files.firstOrNull { it.id == id } ?: return
+        val url = TorrServerApi.streamUrl(b, h, f)
+        AppLog.add("Torrent", "Reproduciendo «${f.name}» (${f.length / (1024 * 1024)} MB)")
+        _ui.value = _ui.value.copy(
+            phase = Phase.CONNECTING, title = f.name, files = emptyList(), streamUrl = url, fileSize = f.length,
+            message = "Preparando el vídeo…"
+        )
+        triedSoftware = false
+        startVlc(url, software = !hwDecoding(), startAtMs = 0)
+        startTicker(generation)
+    }
+
+    // ------------------------------------------------------------------------------------------ VLC
+
+    private fun startVlc(url: String, software: Boolean, startAtMs: Long) {
+        releaseVlc()
+        hwInUse = !software
+        voutCount = 0
+        playingSince = 0
+        try {
+            val lib = LibVLC(app, arrayListOf("--network-caching=3000", "--http-reconnect", "--audio-time-stretch", "-v"))
+            val mp = MediaPlayer(lib)
+            libVlc = lib
+            player = mp
+            mp.setEventListener { e -> onVlcEvent(e) }
+            layout?.let { v -> runCatching { mp.attachViews(v, null, true, false); attached = true } }
+            val media = Media(lib, Uri.parse(url))
+            media.setHWDecoderEnabled(!software, false)
+            media.addOption(":network-caching=3000")
+            if (startAtMs > 0) media.addOption(":start-time=${startAtMs / 1000.0}")
+            mp.setMedia(media)
+            media.release()
+            mp.play()
+            AppLog.add("Torrent", "VLC empieza (aceleración por hardware: ${!software})")
+        } catch (e: Throwable) {
+            AppLog.add("Torrent", "VLC no arrancó: ${e.javaClass.simpleName}: ${e.message}")
+            fail("El reproductor no pudo arrancar: ${e.message}")
+        }
+    }
+
+    private fun releaseVlc() {
+        val mp = player
+        player = null
+        if (mp != null) runCatching {
+            mp.setEventListener(null)
+            mp.stop()
+            if (attached) mp.detachViews()
+            mp.release()
+        }
+        attached = false
+        runCatching { libVlc?.release() }
+        libVlc = null
+    }
+
+    private fun onVlcEvent(e: MediaPlayer.Event) {
+        val p = player ?: return
+        when (e.type) {
+            MediaPlayer.Event.Buffering -> _ui.value = _ui.value.copy(buffering = e.buffering < 100f, bufferPct = e.buffering)
+            MediaPlayer.Event.Playing -> {
+                if (_ui.value.phase != Phase.PLAYING) {
+                    AppLog.add("Torrent", "Reproduciendo")
+                    playingSince = System.currentTimeMillis()
+                }
+                _ui.value = _ui.value.copy(phase = Phase.PLAYING, message = null, paused = false)
+                refreshTracks()
+            }
+            MediaPlayer.Event.Paused -> _ui.value = _ui.value.copy(paused = true)
+            MediaPlayer.Event.Vout -> voutCount = e.voutCount
+            MediaPlayer.Event.LengthChanged -> _ui.value = _ui.value.copy(durationMs = e.lengthChanged)
+            MediaPlayer.Event.TimeChanged -> _ui.value = _ui.value.copy(positionMs = e.timeChanged, buffering = false)
+            MediaPlayer.Event.EndReached -> _ui.value = _ui.value.copy(paused = true)
+            MediaPlayer.Event.EncounteredError -> {
+                AppLog.add("Torrent", "VLC dio error con el vídeo")
+                when {
+                    !TorrServerEngine.running() -> engineDied()
+                    hwInUse && !triedSoftware -> retrySoftware("error de VLC", p.time)
+                    else -> fail("No se puede reproducir este vídeo. Prueba «Otro reproductor».")
+                }
             }
         }
     }
+
+    /** Hay sonido pero no imagen (o error) con la aceleración por hardware: se reintenta sin ella, en el mismo punto. */
+    private fun retrySoftware(why: String, atMs: Long) {
+        val url = _ui.value.streamUrl ?: return
+        triedSoftware = true
+        AppLog.add("Torrent", "Reintentando sin aceleración por hardware ($why)")
+        scope.launch { startVlc(url, software = true, startAtMs = atMs) }
+    }
+
+    private fun refreshTracks() {
+        val p = player ?: return
+        val audio = runCatching { p.audioTracks?.toList().orEmpty() }.getOrDefault(emptyList())
+        val subs = runCatching { p.spuTracks?.toList().orEmpty() }.getOrDefault(emptyList())
+        val a = runCatching { p.audioTrack }.getOrDefault(-1)
+        val s = runCatching { p.spuTrack }.getOrDefault(-1)
+        _ui.value = _ui.value.copy(
+            audio = audio.filter { it.id >= 0 }.map { Track(it.id, it.name ?: "Audio ${it.id}", it.id == a) },
+            subs = subs.map { Track(it.id, if (it.id < 0) "Desactivados" else (it.name ?: "Subtítulos ${it.id}"), it.id == s) }
+        )
+    }
+
+    // ------------------------------------------------------------------------------------------ Estado
 
     private fun startTicker(gen: Int) {
         ticker?.cancel()
         ticker = scope.launch {
             while (isActive && gen == generation) {
-                val st = TorrentEngine.stats()
+                val b = base
+                val h = hash
+                if (!TorrServerEngine.running()) { engineDied(); return@launch }
+                val st = if (b != null && h != null) withContext(Dispatchers.IO) { TorrServerApi.get(b, h) } else null
                 val p = player
-                _ui.value = _ui.value.copy(
-                    downBps = st?.down ?: 0,
-                    peers = st?.peers ?: 0,
-                    seeds = st?.seeds ?: 0,
-                    diskBytes = TorrentEngine.diskUsage(),
-                    buffered = TorrentEngine.bufferedAheadFraction(),
-                    recovering = TorrentEngine.rechecking,
-                    punchUnsupported = TorrentEngine.punchUnsupported,
-                    positionMs = p?.currentPosition ?: 0,
-                    durationMs = p?.duration?.takeIf { it > 0 } ?: 0
-                )
-                if (!playerStarted) {
-                    val prep = TorrentEngine.initialBufferProgress()
+                if (st != null) {
+                    val prep = if (st.preloadSize > 0) (st.preloadedBytes.toFloat() / st.preloadSize).coerceIn(0f, 1f) else 0f
                     _ui.value = _ui.value.copy(
-                        prepare = prep,
-                        message = if ((st?.peers ?: 0) == 0) "Buscando usuarios que lo compartan…" else "Preparando el vídeo… ${(prep * 100).toInt()} %"
+                        downBps = st.downBps, peers = st.activePeers, totalPeers = st.totalPeers, seeds = st.seeders, prepare = prep,
+                        message = if (_ui.value.phase == Phase.CONNECTING)
+                            (if (st.totalPeers == 0) "Buscando usuarios que lo compartan…" else "Preparando el vídeo…") else _ui.value.message
                     )
-                    if (prep >= 1f) startPlayer()
                 }
-                delay(1000)
+                if (p != null) _ui.value = _ui.value.copy(positionMs = p.time, durationMs = p.length.takeIf { it > 0 } ?: _ui.value.durationMs)
+                // Con aceleración por hardware, a veces hay sonido y la imagen no sale: se reintenta sin ella.
+                if (_ui.value.phase == Phase.PLAYING && hwInUse && !triedSoftware && voutCount == 0 &&
+                    playingSince > 0 && System.currentTimeMillis() - playingSince > 5_000 &&
+                    runCatching { (p?.videoTracksCount ?: 0) > 0 }.getOrDefault(false)
+                ) retrySoftware("no hay imagen", p?.time ?: 0)
+                if (_ui.value.phase == Phase.PLAYING && _ui.value.audio.isEmpty()) refreshTracks()
+                delay(1_000)
             }
         }
     }
 
-    private fun startPlayer() {
-        val url = _ui.value.streamUrl ?: return
-        playerStarted = true
-        AppLog.add("Torrent", "Buffer inicial listo: empieza la reproducción")
-        val renderers = DefaultRenderersFactory(app)
-            .setExtensionRendererMode(DefaultRenderersFactory.EXTENSION_RENDERER_MODE_ON)
-            .setEnableDecoderFallback(true)
-        val load = DefaultLoadControl.Builder()
-            .setBufferDurationsMs(15_000, 60_000, 2_500, 5_000)
-            .build()
-        val p = ExoPlayer.Builder(app, renderers).setLoadControl(load).build()
-        // El servidor espera a que llegue cada pieza: lecturas largas permitidas.
-        val http = DefaultHttpDataSource.Factory()
-            .setConnectTimeoutMs(30_000)
-            .setReadTimeoutMs(120_000)
-        val source = ProgressiveMediaSource.Factory(http).createMediaSource(MediaItem.fromUri(url))
-        p.addListener(listener)
-        p.setMediaSource(source)
-        p.playWhenReady = true
-        p.prepare()
-        player = p
-        _ui.value = _ui.value.copy(message = "Abriendo el vídeo…")
-    }
+    // ------------------------------------------------------------------------------------------ Controles
 
     fun togglePause() {
         val p = player ?: return
         if (p.isPlaying) p.pause() else p.play()
-        _ui.value = _ui.value.copy(paused = !p.playWhenReady)
     }
+
+    fun pause() { player?.pause() }
 
     fun seekBy(deltaMs: Long) {
         val p = player ?: return
-        val dur = p.duration.takeIf { it > 0 } ?: Long.MAX_VALUE
-        p.seekTo((p.currentPosition + deltaMs).coerceIn(0L, maxOf(0L, dur - 1_000L)))
+        val len = p.length.takeIf { it > 0 } ?: Long.MAX_VALUE
+        p.setTime((p.time + deltaMs).coerceIn(0L, maxOf(0L, len - 1_000L)))
     }
 
     fun seekToFraction(f: Float) {
         val p = player ?: return
-        val dur = p.duration.takeIf { it > 0 } ?: return
-        p.seekTo((dur * f.coerceIn(0f, 1f)).toLong())
+        val len = p.length.takeIf { it > 0 } ?: return
+        p.setTime((len * f.coerceIn(0f, 1f)).toLong())
     }
 
-    fun selectTrack(t: Track) {
-        val p = player ?: return
-        val group = p.currentTracks.groups.getOrNull(t.group) ?: return
-        p.trackSelectionParameters = p.trackSelectionParameters.buildUpon()
-            .setTrackTypeDisabled(t.type, false)
-            .setOverrideForType(TrackSelectionOverride(group.mediaTrackGroup, t.track))
-            .build()
-    }
+    fun selectAudio(id: Int) { player?.setAudioTrack(id); refreshTracks() }
+    fun selectSub(id: Int) { player?.setSpuTrack(id); refreshTracks() }
+    fun setRate(rate: Float) { player?.setRate(rate) }
+    fun setScale(type: MediaPlayer.ScaleType) { player?.setVideoScale(type) }
 
-    fun disableSubtitles() {
-        val p = player ?: return
-        p.trackSelectionParameters = p.trackSelectionParameters.buildUpon().setTrackTypeDisabled(C.TRACK_TYPE_TEXT, true).build()
-    }
-
-    /** Para todo: reproductor, servidor y descarga (lo descargado se borra). */
+    /** Para el vídeo y suelta el torrent (TorrServer borra su caché). El motor sigue listo para el siguiente. */
     fun stop() {
         generation++
         job?.cancel()
         ticker?.cancel()
-        player?.let { it.removeListener(listener); it.release() }
-        player = null
-        playerStarted = false
-        retries = 0
-        server?.stop()
-        server = null
-        info = null
-        val app = app
-        if (TorrentEngine.handle != null) Thread { runCatching { TorrentEngine.stop(app, deleteFiles = true) } }.start()
+        releaseVlc()
+        val b = base
+        val h = hash
+        if (b != null && h != null) Thread { TorrServerApi.drop(b, h) }.start()
+        hash = null
+        files = emptyList()
         _ui.value = Ui()
     }
 
-    fun release() = stop()
+    /** Al cerrar la app: también el motor. */
+    fun release() {
+        stop()
+        Thread { TorrServerEngine.stop() }.start()
+    }
+
+    private fun engineDied() {
+        val why = TorrServerEngine.exitReason ?: "dejó de responder"
+        AppLog.add("Torrent", "El motor de torrents se cerró: $why")
+        ticker?.cancel()
+        releaseVlc()
+        _ui.value = _ui.value.copy(
+            phase = Phase.FAILED, engineDied = true,
+            message = "El motor de torrents se cerró ($why). La app sigue funcionando: pulsa Reintentar. Los detalles están en el registro."
+        )
+    }
 
     private fun fail(message: String) {
         AppLog.add("Torrent", "Fallo: $message")
@@ -299,23 +361,19 @@ class TorrentPlayback(context: Context) {
         _ui.value = _ui.value.copy(phase = Phase.FAILED, message = message)
     }
 
-    private fun trackList(tracks: Tracks): List<Track> {
-        val out = mutableListOf<Track>()
-        var audioN = 0
-        var subN = 0
-        tracks.groups.forEachIndexed { gi, g ->
-            if (g.type != C.TRACK_TYPE_AUDIO && g.type != C.TRACK_TYPE_TEXT) return@forEachIndexed
-            for (ti in 0 until g.length) {
-                val f = g.getTrackFormat(ti)
-                val n = if (g.type == C.TRACK_TYPE_AUDIO) ++audioN else ++subN
-                val lang = f.language?.takeIf { it.isNotBlank() && it != "und" }?.let { java.util.Locale(it).displayLanguage.replaceFirstChar { c -> c.uppercase() } }
-                val codec = f.sampleMimeType?.substringAfter('/')?.uppercase()
-                val channels = if (f.channelCount > 0) " · ${f.channelCount} canales" else ""
-                val base = f.label ?: lang ?: if (g.type == C.TRACK_TYPE_AUDIO) "Audio $n" else "Subtítulos $n"
-                val label = if (g.type == C.TRACK_TYPE_AUDIO && codec != null) "$base ($codec$channels)" else base
-                out += Track(g.type, gi, ti, label, g.isTrackSelected(ti), g.isTrackSupported(ti))
-            }
+    companion object {
+        private val VIDEO = setOf("mkv", "mp4", "avi", "m4v", "mov", "webm", "ts", "m2ts", "wmv", "flv", "mpg", "mpeg", "3gp", "vob")
+        fun isVideo(name: String) = name.substringAfterLast('.', "").lowercase() in VIDEO
+
+        fun bytes(b: Long): String {
+            if (b < 1024) return "$b B"
+            val units = arrayOf("KB", "MB", "GB", "TB")
+            var v = b / 1024.0
+            var i = 0
+            while (v >= 1024 && i < units.size - 1) { v /= 1024; i++ }
+            return String.format(java.util.Locale.getDefault(), if (v < 10) "%.1f %s" else "%.0f %s", v, units[i])
         }
-        return out
+
+        fun speed(bps: Long) = bytes(bps) + "/s"
     }
 }

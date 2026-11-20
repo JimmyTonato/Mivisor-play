@@ -4,10 +4,9 @@ import android.app.Application
 import android.content.Context
 import com.mivisor.play.data.AppLog
 import com.mivisor.play.data.Kind
-import com.mivisor.play.torrent.TLog
-import com.mivisor.play.torrent.TorrentConfig
-import com.mivisor.play.torrent.TorrentEngine
 import com.mivisor.play.torrent.TorrentPlayback
+import com.mivisor.play.torrserver.TsConfig
+import com.mivisor.play.torrserver.TsLog
 import com.mivisor.play.data.SimpleSourceBook
 import com.mivisor.play.data.Store
 import com.mivisor.tv.catalog.datos.DirectStream
@@ -22,8 +21,10 @@ class PlayApp : Application() {
 
     override fun onCreate() {
         super.onCreate()
+        AppLog.init(this)
         val previous = Thread.getDefaultUncaughtExceptionHandler()
         Thread.setDefaultUncaughtExceptionHandler { t, e ->
+            runCatching { AppLog.add("CIERRE", "${e.javaClass.name}: ${e.message} (hilo ${t.name})") }
             runCatching {
                 getSharedPreferences("mivisor_play_crash", MODE_PRIVATE).edit()
                     .putString("last", "${e.javaClass.name}: ${e.message}\n" + e.stackTrace.take(12).joinToString("\n") { "  at $it" })
@@ -41,22 +42,29 @@ class Graph(context: Context) {
     val book = SimpleSourceBook(app, store)
     /** Emisiones de Ace Stream: Outpace + Media3 (la reproducción de MiVisor TV, sin cambios). */
     val player = PlaybackController(app, book)
-    /** Torrents y magnet: motor de torrents + Media3. */
-    val torrents = TorrentPlayback(app)
+    /** Torrents y magnet: TorrServer (proceso aparte) + VLC, como Ace Stream. */
+    val torrents = TorrentPlayback(app, config = { torrentConfig() }, hwDecoding = { store.hwDecoding })
     /** Un torrent se está viendo en otro reproductor: al salir de la app no se para la descarga. */
     @Volatile var externalPlayback = false
 
     init {
         EngineDiagnostics.enabled = store.verboseLog
         EngineManager.fullP2p = store.fullP2p
-        TLog.sink = { AppLog.add("Motor torrent", it) }
-        applyTorrentSettings()
+        TsLog.sink = { AppLog.add("TorrServer", it) }
         // Cierre inesperado en la sesión anterior: se deja en el registro para poder verlo y copiarlo.
         val crash = app.getSharedPreferences("mivisor_play_crash", Context.MODE_PRIVATE)
-        crash.getString("last", null)?.let {
-            AppLog.add("Cierre anterior", it)
-            crash.edit().remove("last").apply()
-        }
+        val javaCrash = crash.getString("last", null)
+        javaCrash?.let { AppLog.add("Cierre anterior", it) }
+        // ¿Se quedó a medias la sesión anterior (la app estaba en pantalla y se cerró sola)?
+        val unclean = crash.getBoolean("in_foreground", false)
+        crash.edit().remove("last").putBoolean("in_foreground", false).apply()
+        if (unclean && javaCrash == null) Thread { AppLog.captureLastCrash(app.packageName) }.start()
+        AppLog.add("App", "Abierta · ${android.os.Build.MANUFACTURER} ${android.os.Build.MODEL} · Android ${android.os.Build.VERSION.RELEASE} · ${BuildConfig.VERSION_NAME}")
+    }
+
+    /** La app está en pantalla (si se cierra sola así, al abrirla otra vez se recoge el motivo). */
+    fun markForeground(on: Boolean) {
+        app.getSharedPreferences("mivisor_play_crash", Context.MODE_PRIVATE).edit().putBoolean("in_foreground", on).commit()
     }
 
     /** Lo que se pide al reproductor para ver una emisión. */
@@ -79,15 +87,13 @@ class Graph(context: Context) {
         }
     }
 
-    fun applyTorrentSettings() {
-        TorrentEngine.config = TorrentConfig(
-            spaceSaver = store.spaceSaver,
-            cacheMb = store.cacheMb,
-            bufferMb = store.bufferMb,
-            uploadKbps = store.uploadKbps
-        )
-        TorrentEngine.applySettings(app)
-    }
+    /** Ajustes de TorrServer: se aplican al arrancar el motor (si cambian, se reinicia con el siguiente torrent). */
+    fun torrentConfig() = TsConfig(
+        cacheMb = store.cacheMb,
+        useDisk = store.cacheOnDisk,
+        preloadPercent = store.preloadPercent,
+        uploadKbps = store.uploadKbps
+    )
 
     /** Guarda dentro de la app un .torrent elegido en el móvil (para poder abrirlo otra vez desde Recientes). */
     fun importTorrent(uri: android.net.Uri): String? = runCatching {

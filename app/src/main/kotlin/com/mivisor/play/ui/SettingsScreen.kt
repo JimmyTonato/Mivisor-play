@@ -37,8 +37,8 @@ import androidx.compose.ui.unit.dp
 import com.mivisor.play.BuildConfig
 import com.mivisor.play.Graph
 import com.mivisor.play.data.AppLog
-import com.mivisor.play.torrent.TorrentEngine
-import com.mivisor.play.torrent.Util
+import com.mivisor.play.torrent.TorrentPlayback
+import com.mivisor.play.torrserver.TorrServerEngine
 import com.mivisor.tv.engine.EngineDiagnostics
 import com.mivisor.tv.outpace.EngineManager
 import com.mivisor.tv.ui.design.MvIcons
@@ -109,7 +109,11 @@ fun SettingsScreen(graph: Graph, onBack: () -> Unit, onLog: () -> Unit, onLicens
     var rev by remember { mutableIntStateOf(0) }
     var stored by remember { mutableStateOf<Long?>(null) }
     var notice by remember { mutableStateOf<String?>(null) }
-    LaunchedEffect(rev) { stored = withContext(Dispatchers.IO) { TorrentEngine.storedBytes(context) } }
+    LaunchedEffect(rev) {
+        stored = withContext(Dispatchers.IO) {
+            java.io.File(context.filesDir, "torrserver-cache").walkTopDown().filter { it.isFile }.sumOf { it.length() }
+        }
+    }
 
     fun cycle(list: List<Int>, current: Int) = list[(list.indexOf(current) + 1).let { if (it <= 0 || it >= list.size) 0 else it }]
 
@@ -117,31 +121,46 @@ fun SettingsScreen(graph: Graph, onBack: () -> Unit, onLog: () -> Unit, onLicens
         ScreenFrame("Ajustes", onBack) {
             if (notice != null) item { T(notice!!, Pt.SmallStrong, color = Pc.Mint) }
 
-            item { Group("Torrents y magnet") }
+            item { Group("Torrents y magnet (TorrServer + VLC)") }
             item {
-                SettingRow("Borrar lo ya visto", "Solo se guarda en el aparato una caché alrededor de lo que estás viendo: un vídeo de 7 GB no ocupa 7 GB.",
-                    switch = s.spaceSaver) { s.spaceSaver = !s.spaceSaver; graph.applyTorrentSettings(); rev++ }
-            }
-            item {
-                SettingRow("Tamaño de la caché", "Más caché permite volver más atrás sin descargar otra vez.", value = "${s.cacheMb} MB") {
-                    s.cacheMb = cycle(listOf(300, 500, 1000, 2000), s.cacheMb); graph.applyTorrentSettings(); rev++
+                SettingRow("Tamaño de la caché", "Solo se guarda lo que viene justo después de lo que estás viendo y lo último visto; el resto se suelta solo. Más caché, menos cortes y más margen para retroceder.",
+                    value = "${s.cacheMb} MB") {
+                    s.cacheMb = cycle(listOf(64, 128, 256, 512, 1024, 2048), s.cacheMb); notice = "Se aplica con el próximo torrent."; rev++
                 }
             }
             item {
-                SettingRow("Espera antes de empezar", "Lo que se descarga antes de que salga la imagen. Más espera, menos cortes.", value = "${s.bufferMb} MB") {
-                    s.bufferMb = cycle(listOf(5, 10, 20, 40), s.bufferMb); graph.applyTorrentSettings(); rev++
+                SettingRow("Guardar la caché en el disco", "Apagado: en la memoria (no ocupa espacio). Encendido: en la app, para cachés grandes en aparatos con poca memoria. Se borra sola al terminar.",
+                    switch = s.cacheOnDisk) { s.cacheOnDisk = !s.cacheOnDisk; notice = "Se aplica con el próximo torrent."; rev++ }
+            }
+            item {
+                SettingRow("Precarga antes de empezar", "Parte de la caché que se descarga antes de que salga la imagen.", value = "${s.preloadPercent} %") {
+                    s.preloadPercent = cycle(listOf(10, 20, 30, 50, 80), s.preloadPercent); notice = "Se aplica con el próximo torrent."; rev++
                 }
             }
             item {
                 SettingRow("Límite de subida", "Lo que compartes con los demás mientras ves.", value = if (s.uploadKbps == 0) "Sin límite" else "${s.uploadKbps} KB/s") {
-                    s.uploadKbps = cycle(listOf(0, 50, 200, 1000), s.uploadKbps); graph.applyTorrentSettings(); rev++
+                    s.uploadKbps = cycle(listOf(0, 50, 200, 1000), s.uploadKbps); notice = "Se aplica con el próximo torrent."; rev++
                 }
             }
             item {
-                SettingRow("Descargas guardadas", "Se borran solas al salir del reproductor; esto limpia lo que haya quedado.",
-                    value = stored?.let { Util.bytes(it) } ?: "…") {
-                    if (TorrentEngine.handle != null) notice = "Cierra antes el vídeo que se está viendo."
-                    else { TorrentEngine.clearAllDownloads(context); notice = "Descargas borradas."; rev++ }
+                SettingRow("Aceleración por hardware (VLC)", "Menos batería. Si la imagen no sale, la app vuelve a intentarlo sola sin ella.", switch = s.hwDecoding) {
+                    s.hwDecoding = !s.hwDecoding; rev++
+                }
+            }
+            item {
+                SettingRow("Caché en el disco ahora", "Lo que haya quedado de la caché en el disco. Pulsa para borrarlo.",
+                    value = stored?.let { TorrentPlayback.bytes(it) } ?: "…") {
+                    if (graph.torrents.ui.value.active) notice = "Cierra antes el vídeo que se está viendo."
+                    else {
+                        TorrServerEngine.stop()
+                        java.io.File(context.filesDir, "torrserver-cache").listFiles()?.forEach { it.deleteRecursively() }
+                        notice = "Caché borrada."; rev++
+                    }
+                }
+            }
+            item {
+                SettingRow("Reiniciar el motor de torrents", "Por si un torrent se queda atascado.", value = null) {
+                    graph.torrents.stop(); scope.launch(Dispatchers.IO) { TorrServerEngine.stop() }; notice = "Motor de torrents parado: arrancará con el próximo torrent."
                 }
             }
 
@@ -198,9 +217,9 @@ fun SettingsScreen(graph: Graph, onBack: () -> Unit, onLog: () -> Unit, onLicens
 
             item { Group("Acerca de") }
             item {
-                SettingRow("MiVisor Play ${BuildConfig.VERSION_NAME}", "Outpace ${BuildConfig.OUTPACE_COMMIT.take(10)} · libtorrent · Media3", value = null) { }
+                SettingRow("MiVisor Play ${BuildConfig.VERSION_NAME}", "Outpace ${BuildConfig.OUTPACE_COMMIT.take(10)} · TorrServer · Media3 · VLC", value = null) { }
             }
-            item { SettingRow("Licencias", "Outpace (AGPL-3.0), Inter y las demás piezas de la app.", value = null, onClick = onLicenses) }
+            item { SettingRow("Licencias", "Outpace (AGPL-3.0), TorrServer (GPL-3.0), VLC (LGPL-2.1), Inter y las demás piezas.", value = null, onClick = onLicenses) }
         }
     }
 }
