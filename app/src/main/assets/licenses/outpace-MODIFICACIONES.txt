@@ -1,0 +1,41 @@
+MiVisor TV incluye Outpace (https://github.com/jamezrin/outpace, AGPL-3.0-or-later) compilado desde el
+commit indicado en Ajustes › Motor, con estas modificaciones de MiVisor TV:
+
+0001-catalog-hosts-env.patch (crates/ace-swarm/src/resolve.rs)
+  Los servidores del catálogo de Ace Stream se pueden indicar con la variable OUTPACE_CATALOG_HOSTS
+  ("ip:puerto,ip:puerto"; solo IPv4 públicas, máx. 16). Se prueban primero y en orden; los que trae
+  Outpace de serie quedan detrás como respaldo.
+
+0002-http-trackers-diagnostico.patch (crates/ace-swarm/src/discover.rs, lib.rs, http_tracker.rs nuevo)
+  Además de los trackers UDP, anuncia en los trackers HTTP(S) que trae el descriptor (respuesta
+  compacta, solo IPv4, mismas protecciones de red que el resto de descargas). Escribe en la salida
+  líneas "outpace: [mivisor] ..." con los trackers del descriptor y los pares encontrados por UDP,
+  HTTP y DHT, para el diagnóstico de la app.
+
+0003-descriptor-diagnostico.patch (crates/ace-swarm/src/resolve.rs, crates/ace-engine/src/ace_provider.rs)
+  Escribe en la salida qué servidor del catálogo dio el descriptor (y cuáles no) y, al abrir un canal,
+  el descriptor recibido: infohash, si está firmado, tamaño de pieza, título y lista completa de trackers.
+
+0004-trackers-robustos.patch (crates/ace-wire/src/transport.rs)
+  Lectura robusta de los trackers del descriptor. Fuentes: "trackers", "announce-list" y "announce";
+  cadenas o listas (también listas de listas). Separa URLs por espacios, saltos de línea, comas,
+  punto y coma o "|", y también cuando vienen pegadas. Limpia comillas, pasa el esquema a minúsculas,
+  convierte "host:puerto" en udp://host:puerto/announce, descarta ws(s):// y basura, quita repetidas
+  y deja como mucho 64. También acepta enlaces magnet (tr=), URLs codificadas (%3A%2F%2F), el prefijo
+  "tr=" y quita caracteres invisibles. Escribe en la salida los campos que trae cada descriptor.
+
+0005-conexion-6s.patch (crates/ace-swarm/src/live_session/mod.rs)
+  Tiempo máximo para conectar con cada par: 6 s en vez de 3 s.
+
+0006-catalogo-elige-emision-viva.patch (crates/ace-swarm/src/resolve.rs, discover.rs)
+  Pregunta a todos los servidores del catálogo a la vez (espera 1,5 s tras el primero). Si dan
+  descriptores de emisiones distintas para el mismo content-id, pregunta a sus trackers cuánta gente
+  tiene cada una y usa la que más tenga. Lo escribe todo en la salida para el diagnóstico.
+
+0007-checktorrent-emision-actual.patch (crates/ace-swarm/src/resolve.rs)
+  Tras obtener el descriptor de un content-id, pregunta al catálogo (/checktorrent, mismo esquema
+  de firma de petición y de respuesta que /gettorrent) cuál es la emisión actual de ese descriptor y
+  usa su infohash. En emisiones permanentes, el infohash calculado del descriptor es el de la
+  primera emisión y ya no tiene gente. Si el catálogo no responde, se usa el calculado.
+
+El código fuente de las modificaciones está en el repositorio de MiVisor TV, carpeta tools/outpace-patches.

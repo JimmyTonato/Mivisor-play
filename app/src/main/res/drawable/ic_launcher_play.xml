@@ -1,0 +1,9 @@
+<?xml version="1.0" encoding="utf-8"?>
+<!-- Primer plano del icono: órbita, triángulo de reproducir y el punto verde menta (zona segura de 66 dp). -->
+<vector xmlns:android="http://schemas.android.com/apk/res/android"
+    android:width="108dp" android:height="108dp" android:viewportWidth="108" android:viewportHeight="108">
+    <path android:strokeColor="#40FFFFFF" android:strokeWidth="3"
+        android:pathData="M54,32a22,22 0,1 0,0.01 0z" />
+    <path android:fillColor="#FFFFFFFF" android:pathData="M47,42L66,54L47,66Z" />
+    <path android:fillColor="#FF4FE3C1" android:pathData="M72,36m-4,0a4,4 0,1 1,8 0a4,4 0,1 1,-8 0" />
+</vector>
